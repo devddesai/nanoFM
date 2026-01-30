@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn import functional as F
 
 from model import GPTConfig, GPT
 
@@ -218,9 +219,22 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X = get_batch(split)
+            b, t_seq = X.size()
+
+            # flow matching setup
+            x1 = model.transformer.wte(X)
+            x0 = torch.randn_like(x1)
+            t = torch.rand(b, device = device)
+            t_env = t.view(b, 1, 1)
+
+            xt = (1 - t_env) * x0 + t_env * x1
+            v_target = x1 - x0
+
             with ctx:
-                logits, loss = model(X, Y)
+                v_pred = model(xt, t)
+                loss = F.mse_loss(v_pred, v_target)
+                
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -246,7 +260,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed

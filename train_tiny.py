@@ -2,6 +2,10 @@ import torch
 import torch.nn.functional as F
 from model import GPT, GPTConfig
 
+
+#### add wandb logging
+import wandb
+
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
