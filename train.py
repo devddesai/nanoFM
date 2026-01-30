@@ -155,42 +155,14 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+
+raw_model = model # unwrap DDP container if needed
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -222,18 +194,17 @@ def estimate_loss():
             X = get_batch(split)
             b, t_seq = X.size()
 
-            # flow matching setup
-            x1 = model.transformer.wte(X)
+            # flow matching setup - use raw_model for accessing embeddings
+            x1 = raw_model.transformer.wte(X)
             x0 = torch.randn_like(x1)
-            t = torch.rand(b, device = device)
-            t_env = t.view(b, 1, 1)
+            t = torch.rand(b, device=device)
+            t_exp = t.view(b, 1, 1)
 
-            xt = (1 - t_env) * x0 + t_env * x1
+            xt = (1 - t_exp) * x0 + t_exp * x1
             v_target = x1 - x0
 
             with ctx:
-                v_pred = model(xt, t)
-                loss = F.mse_loss(v_pred, v_target)
+                v_pred, loss = model(xt, t, v_target)
                 
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -263,7 +234,6 @@ if wandb_log and master_process:
 X = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
 
@@ -309,13 +279,27 @@ while True:
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+
+        # Flow matching setup
+        b, t_seq = X.size()
+        x1 = raw_model.transformer.wte(X)  # target embeddings
+        x0 = torch.randn_like(x1)           # noise
+        t = torch.rand(b, device=device)    # random time
+        t_expanded = t.view(b, 1, 1)
+
+        # Interpolate
+        xt = (1 - t_expanded) * x0 + t_expanded * x1
+        v_target = x1 - x0  # velocity target
+
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            v_pred, loss = model(xt, t, v_target)
+            loss = loss / gradient_accumulation_steps
+
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+        X = get_batch('train')
+
         scaler.scale(loss).backward()
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)

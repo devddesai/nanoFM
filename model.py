@@ -83,7 +83,7 @@ class AdaptiveLayerNorm(nn.Module):
     """ LayerNorm with time step embeddings """
 
     def __init__(self, n_embd, eps=1e-6):
-        super.init()
+        super.__init__()
         # elementwise affine = False bc we provide scale/shift from t
         self.ln = nn.LayerNorm(n_embd, elementwise_affine=False, eps=eps)
     
@@ -112,9 +112,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = AdaptiveLayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = AdaptiveLayerNorm(config.n_embd)
         self.attn = SelfAttention(config)
-        self.ln_2 = AdaptiveLayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = AdaptiveLayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
         self.adaLN_Modulation = nn.Sequential(nn.SiLU(), nn.Linear(config.n_embd, 6*config.n_embd))
@@ -191,18 +191,17 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, t, targets=None):
-        device = idx.device
-        b, t_seq = idx.size()
+    def forward(self, x, t, targets=None):
+        device = x.device
+        b, t_seq, _ = x.size()
         assert t_seq <= self.config.block_size, f"Cannot forward sequence of length {t_seq}, block size is only {self.config.block_size}"
         
         t_emb = self.time_embedder(t) # shape: [B, n_embd]
         pos = torch.arange(0, t_seq, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(x + pos_emb)
 
         for block in self.transformer.h:
             x = block(x, t_emb)
@@ -220,16 +219,17 @@ class GPT(nn.Module):
         return v_pred, loss
     
     @torch.no_grad()
-    def sample(self, x_init, steps = 50):
+    def sample(self, x_init, steps=50):
         '''
         Simple Euler sampler for inference
         x_init: initial noisy input (B, T, C)
         '''
         self.eval()
-        xt =  x_init
-        dt = 1.0  / steps
+        xt = x_init
+        dt = 1.0 / steps
         for i in range(steps):
-            t = torch.full((x_init.shape[0],), 1.0 - i * dt, device=x_init.device)
+            t_curr = i * dt
+            t = torch.full((x_init.shape[0],), t_curr, device=x_init.device)
             v, _ = self.forward(xt, t)
             xt = xt + v * dt
         return xt
